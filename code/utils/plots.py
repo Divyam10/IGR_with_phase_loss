@@ -325,7 +325,7 @@ def get_grid(points,resolution):
 
 
 def get_grid_uniform(resolution):
-    x = np.linspace(-1.2,1.2, resolution)
+    x = np.linspace(-5,5,resolution)
     y = x
     z = x
 

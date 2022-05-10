@@ -14,7 +14,9 @@ from model.sample import Sampler
 from model.network import gradient
 from scipy.spatial import cKDTree
 from utils.plots import plot_surface, plot_cuts
-
+import random
+import math
+import csv
 
 class ReconstructionRunner:
 
@@ -23,7 +25,8 @@ class ReconstructionRunner:
         print("running")
 
         self.data = self.data.cuda()
-        self.data.requires_grad_()
+        # print(self.data.shape)
+        # self.data.requires_grad_()
 
         if self.eval:
 
@@ -37,14 +40,23 @@ class ReconstructionRunner:
 
         print("training")
 
-        for epoch in range(self.startepoch, self.nepochs + 1):
+        for epoch in range(self.startepoch +1 , self.nepochs + 1):
 
             indices = torch.tensor(np.random.choice(self.data.shape[0], self.points_batch, False))
-
-            cur_data = self.data[indices]
-
-            mnfld_pnts = cur_data[:, :self.d_in]
-            mnfld_sigma = self.local_sigma[indices]
+            
+            ## Get Ball Points from a set of all the ball points.
+            
+            ball_pts = torch.tensor(self.all_ball_points)[indices].reshape((self.points_batch*self.n_ball,3))
+            
+            # print(ball_pts.shape)
+            
+            ## Get Normal polints and Sampled X if Normals = True
+        
+            if self.with_normals:
+                norml_pnts = self.data[indices,3:]
+                curr_data = self.data[indices, :3]
+            mnfld_pnts = ball_pts.cuda().requires_grad_()
+            
 
             if epoch % self.conf.get_int('train.checkpoint_frequency') == 0:
                 print('saving checkpoint: ', epoch)
@@ -53,38 +65,49 @@ class ReconstructionRunner:
                 self.plot_shapes(epoch)
 
             # change back to train mode
+            
             self.network.train()
             self.adjust_learning_rate(epoch)
-
-            nonmnfld_pnts = self.sampler.get_points(mnfld_pnts.unsqueeze(0), mnfld_sigma.unsqueeze(0)).squeeze()
-
+            
+            # Get Omega Points 
+            
+            nonmnfld_pnts = self.get_omega_smaples(ball_pts.shape[0]).cuda().requires_grad_()
+            
             # forward pass
 
             mnfld_pred = self.network(mnfld_pnts)
-            nonmnfld_pred = self.network(nonmnfld_pnts)
+            nonmnfld_pred = self.network(nonmnfld_pnts.float())
+            
+            
+            # reconstruction loss
 
-            # compute grad
-
-            mnfld_grad = gradient(mnfld_pnts, mnfld_pred)
+            mnfld_pred = mnfld_pred.reshape((self.points_batch, self.n_ball)) 
+            recon_l = (mnfld_pred.mean(axis=1)).abs().mean()
+    
+            
+             # Regularization loss 
+            
             nonmnfld_grad = gradient(nonmnfld_pnts, nonmnfld_pred)
-
-            # manifold loss
-
-            mnfld_loss = (mnfld_pred.abs()).mean()
-
-            # eikonal loss
-
-            grad_loss = ((nonmnfld_grad.norm(2, dim=-1) - 1) ** 2).mean()
-
-            loss = mnfld_loss + self.grad_lambda * grad_loss
-
+            # print(nonmnfld_grad.shape)
+            d_well = self.double_w(nonmnfld_pred)
+            r_loss = ( self.ep  * nonmnfld_grad.norm(2, dim=-1) ** 2 + d_well).mean()
+            
+            # print(r_loss)
+            
+            loss = self.lamda*recon_l + r_loss
+            
             # normals loss
-
             if self.with_normals:
-                normals = cur_data[:, -self.d_in:]
-                normals_loss = ((mnfld_grad - normals).abs()).norm(2, dim=1).mean()
-                loss = loss + self.normals_lambda * normals_loss
+            
+                u = self.network(curr_data).reshape(-1, 1)
+                w = ( self.ep  ** 0.5) * u
+                normals_loss = (norml_pnts - w).norm(1, dim=1).mean()
+                # print(normals_loss)
+                
+                loss = loss + self.mu * normals_loss
+                
             else:
+                
                 normals_loss = torch.zeros(1)
 
             # back propagation
@@ -96,10 +119,10 @@ class ReconstructionRunner:
             self.optimizer.step()
 
             if epoch % self.conf.get_int('train.status_frequency') == 0:
-                print('Train Epoch: [{}/{} ({:.0f}%)]\tTrain Loss: {:.6f}\tManifold loss: {:.6f}'
-                    '\tGrad loss: {:.6f}\tNormals Loss: {:.6f}'.format(
+                print('Train Epoch: [{}/{} ({:.0f}%)]\tTrain Loss: {:.6f}\tRecon loss: {:.6f}'
+                    '\tRecog loss: {:.6f}\tNormals Loss: {:.6f}'.format(
                     epoch, self.nepochs, 100. * epoch / self.nepochs,
-                    loss.item(), mnfld_loss.item(), grad_loss.item(), normals_loss.item()))
+                    loss.item(), recon_l.item(), r_loss.item(), normals_loss.item()))
 
     def plot_shapes(self, epoch, path=None, with_cuts=False):
         # plot network validation shapes
@@ -113,7 +136,7 @@ class ReconstructionRunner:
             indices = torch.tensor(np.random.choice(self.data.shape[0], self.points_batch, False))
 
             pnts = self.data[indices, :3]
-
+            print('----------------------------------')
             plot_surface(with_points=True,
                          points=pnts,
                          decoder=self.network,
@@ -128,6 +151,19 @@ class ReconstructionRunner:
                           path=path,
                           epoch=epoch,
                           near_zero=False)
+                
+    ## Sampling Omrga Points inside a bounding box 
+    def get_omega_smaples(self,bp_size):
+
+        xs = 1.5*((self.x2 - self.x1)*np.random.rand(bp_size) + self.x1)
+        ys = 1.5*((self.y2 - self.y1)*np.random.rand(bp_size) + self.y1)
+        zs = 1.5*((self.z2 - self.z1)*np.random.rand(bp_size) + self.z1)
+
+        return torch.tensor(np.array(list(zip(xs,ys,zs))))
+    
+    def double_w(self, s):
+        
+        return (s ** 2) - 2 * (torch.abs(s)) + 1
 
     def __init__(self, **kwargs):
 
@@ -177,17 +213,46 @@ class ReconstructionRunner:
         utils.mkdir_ifnotexists(utils.concat_home_dir(os.path.join(self.home_dir, self.exps_folder_name)))
 
         self.input_file = self.conf.get_string('train.input_path')
-        self.data = utils.load_point_cloud_by_file_extension(self.input_file)
+        
+        self.with_normals = False
+        self.data = utils.load_point_cloud_by_file_extension(self.input_file,  self.with_normals)
+        
+        ### HyperParamters setting 
+        
+        self.r = 0.01
+        self.ep = 0.01
+        self.lamda = 0.2
+        self.mu = 0.2
+        self.n_ball = 50
+        self.all_ball_points = []
+        
+        
+        ## Looping over all the points to get corresponding ball points
 
-        sigma_set = []
-        ptree = cKDTree(self.data)
+        for xo,yo,zo in self.data[: , :3]:
 
-        for p in np.array_split(self.data, 100, axis=0):
-            d = ptree.query(p, 50 + 1)
-            sigma_set.append(d[0][:, -1])
+            x_sb, y_sb, z_sb = [],[],[]
+            temp = []
+            
+            for i in range(0,self.n_ball):
 
-        sigmas = np.concatenate(sigma_set)
-        self.local_sigma = torch.from_numpy(sigmas).float().cuda()
+                theta = random.uniform(*(0, 360))
+                phi   = random.uniform(*(0, 360))
+
+                x_sb.append(xo + math.sin(phi)* math.cos(theta)*self.r)
+                y_sb.append(yo + math.sin(phi)* math.sin(theta)*self.r)
+                z_sb.append(zo + math.cos(phi)*self.r)
+
+            temp = np.column_stack((np.array(x_sb), np.array(y_sb), np.array(z_sb)))
+            self.all_ball_points.append(temp)
+            
+        self.all_ball_points = np.array(self.all_ball_points)
+        
+        #### Bounding Box
+        
+        
+        self.x1, self.y1, self.z1 = torch.min(self.data[:,:3], axis=0).values.numpy()
+        self.x2, self.y2, self.z2 = torch.max(self.data[:,:3], axis=0).values.numpy()
 
         self.expdir = utils.concat_home_dir(os.path.join(self.home_dir, self.exps_folder_name, self.expname))
         utils.mkdir_ifnotexists(self.expdir)
@@ -218,16 +283,7 @@ class ReconstructionRunner:
         self.nepochs = kwargs['nepochs']
 
         self.points_batch = kwargs['points_batch']
-
-        self.global_sigma = self.conf.get_float('network.sampler.properties.global_sigma')
-        self.sampler = Sampler.get_sampler(self.conf.get_string('network.sampler.sampler_type'))(self.global_sigma,
-                                                                                                 self.local_sigma)
-        self.grad_lambda = self.conf.get_float('network.loss.lambda')
-        self.normals_lambda = self.conf.get_float('network.loss.normals_lambda')
-
-        # use normals if data has  normals and normals_lambda is positive
-        self.with_normals = self.normals_lambda > 0 and self.data.shape[-1] >= 6
-
+        
         self.d_in = self.conf.get_int('train.d_in')
 
         self.network = utils.get_class(self.conf.get_string('train.network_class'))(d_in=self.d_in,
@@ -308,23 +364,23 @@ class ReconstructionRunner:
         torch.save(
             {"epoch": epoch, "optimizer_state_dict": self.optimizer.state_dict()},
             os.path.join(self.checkpoints_path, self.optimizer_params_subdir, "latest.pth"))
-
-
+        
+    
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--points_batch', type=int, default=16384, help='point batch size')
+    parser.add_argument('--points_batch', type=int, default=128, help='point batch size')
     parser.add_argument('--nepoch', type=int, default=100000, help='number of epochs to train for')
     parser.add_argument('--conf', type=str, default='setup.conf')
     parser.add_argument('--expname', type=str, default='single_shape')
-    parser.add_argument('--gpu', type=str, default='2', help='GPU to use [default: GPU auto]')
+    parser.add_argument('--gpu', type=str, default='0', help='GPU to use [default: GPU auto]')
     parser.add_argument('--is_continue', default=False, action="store_true", help='continue')
     parser.add_argument('--timestamp', default='latest', type=str)
     parser.add_argument('--checkpoint', default='latest', type=str)
     parser.add_argument('--eval', default=False, action="store_true")
 
     args = parser.parse_args()
-
+ 
     if args.gpu == "auto":
         deviceIDs = GPUtil.getAvailable(order='memory', limit=1, maxLoad=0.5, maxMemory=0.5, includeNan=False, excludeID=[],
                                     excludeUUID=[])
