@@ -214,18 +214,25 @@ class ReconstructionRunner:
 
         self.input_file = self.conf.get_string('train.input_path')
         
-        self.with_normals = False
+        self.with_normals = kwargs['with_normals']
         self.data = utils.load_point_cloud_by_file_extension(self.input_file,  self.with_normals)
         
         ### HyperParamters setting 
         
-        self.r = 0.01
+#         self.r = 0.01
+#         self.ep = 0.01
+#         self.lamda = 0.2
+#         self.mu = 0.2
+#         self.n_ball = 50
+#         self.all_ball_points = []
+
         self.ep = 0.01
-        self.lamda = 0.2
-        self.mu = 0.2
-        self.n_ball = 50
-        self.all_ball_points = []
+        self.r = kwargs['r']
+        self.lamda = kwargs['lamda']
+        self.mu = kwargs['mu']
+        self.n_ball = kwargs['n_ball']
         
+        self.all_ball_points = []
         
         ## Looping over all the points to get corresponding ball points
 
@@ -378,7 +385,13 @@ if __name__ == '__main__':
     parser.add_argument('--timestamp', default='latest', type=str)
     parser.add_argument('--checkpoint', default='latest', type=str)
     parser.add_argument('--eval', default=False, action="store_true")
-
+    parser.add_argument('--lamda',default=0.2, help = 'Reconstruction Loss - Lamda')
+    parser.add_argument('--mu',default=0.2, help = 'Regularization Loss - mu')
+    parser.add_argument('--r',default=0.01, help = 'Radius to select ball points from')
+    parser.add_argument('--n_ball',default=50, help = 'number of ball to be selected')
+    parser.add_argument('--with_normals',default=False, action="store_true")
+    
+    
     args = parser.parse_args()
  
     if args.gpu == "auto":
@@ -397,7 +410,13 @@ if __name__ == '__main__':
             is_continue=args.is_continue,
             timestamp=args.timestamp,
             checkpoint=args.checkpoint,
-            eval=args.eval
+            eval=args.eval,
+            lamda=args.lamda,
+            mu=args.mu,
+            r=args.r,
+            n_ball=args.n_ball,
+            with_normals=args.with_normals
+        
     )
 
     trainrunner.run()
